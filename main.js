@@ -1,23 +1,25 @@
-// main.js
-// Acheron v3 - Entry point
+// main.js (Acheron v4)
+// ESM entry point
 import { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, DisconnectReason } from '@whiskeysockets/baileys';
 import qrcode from 'qrcode-terminal';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs/promises';
+import express from 'express';
 
 import { logger } from './utils/logger.js';
 import { parseMessage } from './utils/messageParser.js';
 import { ensureFolder, readJSON, writeJSON } from './utils/fileUtils.js';
-import * as memory from './utils/memory.js';
+import * as db from './utils/db.js';
+import * as mem from './utils/memory.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const SESSION_DIR = path.join(__dirname, 'session');
-const CMD_DIR = path.join(__dirname, 'commands');
 const LOGS_DIR = path.join(__dirname, 'logs');
 const DATA_DIR = path.join(__dirname, 'data');
+const CMD_DIR = path.join(__dirname, 'commands');
 const CONFIG_PATH = path.join(__dirname, 'config.json');
 
 let sock = null;
@@ -25,17 +27,16 @@ let commands = new Map();
 
 async function loadConfig() {
   try {
-    const cfg = await readJSON(CONFIG_PATH);
-    return cfg;
-  } catch (err) {
-    logger.warn('config.json not found — creating default config.json');
+    return await readJSON(CONFIG_PATH);
+  } catch {
     const defaultConfig = {
       prefix: '!',
       owner: '1234567890@s.whatsapp.net',
       chatMode: false,
       typingDelayMs: 800,
       mood: 'calm',
-      memoryPruneDays: 30
+      memoryPruneDays: 30,
+      dashboardPort: 3000
     };
     await writeJSON(CONFIG_PATH, defaultConfig);
     return defaultConfig;
@@ -43,23 +44,15 @@ async function loadConfig() {
 }
 
 async function loadCommands() {
-  try {
-    const files = await fs.readdir(CMD_DIR);
-    const map = new Map();
-    await Promise.all(files.map(async (f) => {
-      if (!f.endsWith('.js')) return;
-      const mod = await import(path.join(CMD_DIR, f));
-      const cmd = mod.default;
-      if (cmd && cmd.name) {
-        map.set(cmd.name, cmd);
-        logger.info(`Loaded command: ${cmd.name}`);
-      }
-    }));
-    return map;
-  } catch (err) {
-    logger.error('Failed to load commands: ' + (err.stack || err));
-    return new Map();
-  }
+  const files = await fs.readdir(CMD_DIR);
+  const map = new Map();
+  await Promise.all(files.map(async (f) => {
+    if (!f.endsWith('.js')) return;
+    const mod = await import(path.join(CMD_DIR, f));
+    const cmd = mod.default;
+    if (cmd && cmd.name) map.set(cmd.name, cmd);
+  }));
+  return map;
 }
 
 async function logMessage(line) {
@@ -73,25 +66,80 @@ async function logMessage(line) {
   }
 }
 
+async function startDashboard(port) {
+  const app = express();
+  app.get('/', (req, res) => {
+    try {
+      const stats = db.getStats();
+      const top = db.getTopUsers(10);
+      // build simple HTML (self-contained)
+      const html = `
+        <!doctype html>
+        <html>
+        <head>
+          <meta charset="utf-8"/>
+          <title>Acheron Dashboard</title>
+          <style>
+            body { font-family: Arial, sans-serif; background: #0f0f12; color: #e6e6e6; padding: 20px; }
+            h1 { color: #f6c85f; }
+            .card { background: #111216; padding: 12px; border-radius: 8px; margin-bottom: 12px; }
+            table { width:100%; border-collapse: collapse; }
+            th, td { padding:8px; text-align:left; border-bottom:1px solid #222; }
+            a { color:#9ecbff; text-decoration:none; }
+          </style>
+        </head>
+        <body>
+          <h1>🖤 Acheron — Dashboard</h1>
+          <div class="card">
+            <strong>Total messages:</strong> ${stats.totalMessages} <br/>
+            <strong>Known users:</strong> ${stats.usersCount}
+          </div>
+          <div class="card">
+            <h3>Top users</h3>
+            <table>
+              <thead><tr><th>#</th><th>Name</th><th>Messages</th><th>JID</th></tr></thead>
+              <tbody>
+                ${top.map((u,i)=>`<tr><td>${i+1}</td><td>${escapeHtml(u.pushName||'Unknown')}</td><td>${u.messageCount||0}</td><td>${u.jid}</td></tr>`).join('')}
+              </tbody>
+            </table>
+          </div>
+          <footer style="opacity:0.7">Local dashboard — offline only.</footer>
+        </body>
+        </html>
+      `.trim();
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      res.send(html);
+    } catch (err) {
+      res.status(500).send('Dashboard error');
+    }
+  });
+
+  function escapeHtml(s){ return String(s||'').replace(/[&<>"']/g, (m)=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[m])); }
+
+  app.listen(port, () => logger.info(`Dashboard running at http://localhost:${port}`));
+}
+
 async function start() {
-  const config = await loadConfig();
+  const cfg = await loadConfig();
 
   try {
     await ensureFolder(SESSION_DIR);
     await ensureFolder(DATA_DIR);
-    await memory.init(DATA_DIR, config.memoryPruneDays || 30);
+    // init db
+    db.initDB(DATA_DIR);
+    // optional migration from JSON data (safe)
+    await db.migrateFromJson(DATA_DIR).catch(()=>{});
 
+    // init memory engine (for replies) using db (it expects db-backed functions)
+    mem.initWithDB(db, cfg.memoryPruneDays || 30);
+
+    // load commands
     commands = await loadCommands();
 
     const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
     const { version } = await fetchLatestBaileysVersion().catch(() => ({ version: [2, 2314, 3] }));
 
-    sock = makeWASocket({
-      version,
-      auth: state,
-      printQRInTerminal: false
-    });
-
+    sock = makeWASocket({ version, auth: state, printQRInTerminal: false });
     sock.ev.on('creds.update', saveCreds);
 
     logger.ready('⚡ Acheron is online.');
@@ -99,15 +147,10 @@ async function start() {
     sock.ev.on('connection.update', (update) => {
       try {
         const { connection, lastDisconnect, qr } = update;
-        if (qr) {
-          qrcode.generate(qr, { small: true });
-          logger.info('QR generated — scan with WhatsApp.');
-        }
-        if (connection === 'open') {
-          logger.connected('Connected to WhatsApp.');
-        } else if (connection === 'connecting') {
-          logger.info('Connecting to WhatsApp...');
-        } else if (connection === 'close') {
+        if (qr) { qrcode.generate(qr, { small: true }); logger.info('QR generated — scan with WhatsApp.'); }
+        if (connection === 'open') logger.connected('Connected to WhatsApp.');
+        else if (connection === 'connecting') logger.info('Connecting...');
+        else if (connection === 'close') {
           const reason = (lastDisconnect && lastDisconnect.error) ? lastDisconnect.error : null;
           logger.warn('Connection closed. Reason: ' + (reason ? JSON.stringify(reason) : 'unknown'));
           const isLoggedOut = reason && (reason?.output?.statusCode === DisconnectReason.loggedOut || /logged out/i.test(String(reason)));
@@ -115,15 +158,13 @@ async function start() {
             logger.error('Logged out. Remove session folder and re-scan QR.');
           } else {
             logger.warn('Attempting reconnect in 3s...');
-            setTimeout(() => start().catch(e => logger.error('Reconnect failed: ' + (e.stack || e))), 3000);
+            setTimeout(()=>start().catch(e=>logger.error('Reconnect failed: '+(e.stack||e))), 3000);
           }
         }
-      } catch (err) {
-        logger.error('connection.update handler error: ' + (err.stack || err));
-      }
+      } catch (err) { logger.error('connection.update err: ' + (err.stack||err)); }
     });
 
-    // handle incoming messages
+    // messages
     sock.ev.on('messages.upsert', async (m) => {
       try {
         if (!m || !m.messages) return;
@@ -133,20 +174,23 @@ async function start() {
 
         const parsed = parseMessage(msg);
         if (!parsed) return;
-        const { text, jid } = parsed;
+        const { text } = parsed;
         if (!text) return;
 
-        // log to file
-        await logMessage(`${jid} -> ${text.replace(/\n/g, '\\n')}`);
-
-        // update memory (user stats)
+        const remoteJid = msg.key.remoteJid || parsed.jid;
+        const participant = msg.key.participant || remoteJid;
         const pushName = msg.pushName || 'Unknown';
-        const isGroup = jid.endsWith('@g.us');
-        await memory.recordMessage(msg.key.remoteJid || jid, msg.key.participant || msg.key.remoteJid, pushName, isGroup);
+        const isGroup = remoteJid.endsWith('@g.us');
 
-        // reload config each message (allows dynamic edits)
-        const cfg = await loadConfig();
-        const prefix = (cfg.prefix || '!').toString();
+        // log to file
+        await logMessage(`${remoteJid} -> ${text.replace(/\n/g,'\\n')}`);
+
+        // record to DB
+        db.recordMessage(isGroup ? participant : remoteJid, pushName);
+
+        // dynamic prefix: per-chat or global fallback to config
+        const perPrefix = db.getPrefixFor(remoteJid) || db.getPrefixFor(participant) || db.getGlobalPrefix();
+        const prefix = perPrefix || cfg.prefix || '!';
 
         // handle commands
         if (text.startsWith(prefix)) {
@@ -154,79 +198,70 @@ async function start() {
           if (!body) return;
           const [rawCmd, ...args] = body.split(/\s+/);
           const cmdName = rawCmd.toLowerCase();
-
           if (commands.has(cmdName)) {
             const cmd = commands.get(cmdName);
             try {
-              if (cmd.adminOnly && cfg.owner !== (msg.key.participant || msg.key.remoteJid)) {
-                await sock.sendMessage(jid, { text: '⚠️ You are not authorized to use this command.' }, { quoted: msg });
+              if (cmd.adminOnly && cfg.owner !== (participant || remoteJid)) {
+                await sock.sendMessage(remoteJid, { text: '⚠️ You are not authorized to use this command.' }, { quoted: msg });
                 return;
               }
-              await cmd.execute({ sock, msg, jid, args, logger, configPath: CONFIG_PATH });
+              await cmd.execute({ sock, msg, jid: remoteJid, args, logger, configPath: CONFIG_PATH, db });
             } catch (err) {
-              logger.error(`Command ${cmdName} failed: ` + (err.stack || err));
-              await sock.sendMessage(jid, { text: '⚠️ Command execution failed.' }, { quoted: msg });
+              logger.error(`Command ${cmdName} failed: ${err?.stack||err}`);
+              await sock.sendMessage(remoteJid, { text: '⚠️ Command failed to execute.' }, { quoted: msg });
             }
           } else {
-            await sock.sendMessage(jid, { text: `Unknown command. Use ${prefix}help to list commands.` }, { quoted: msg });
+            await sock.sendMessage(remoteJid, { text: `Unknown command. Use ${prefix}help to list commands.` }, { quoted: msg });
           }
           return;
         }
 
-        // Non-command messages -> auto replies if chatMode on
-        if (cfg.chatMode) {
+        // non-command chatMode
+        const freshCfg = await loadConfig();
+        if (freshCfg.chatMode) {
           try {
-            await sock.sendPresenceUpdate('composing', jid).catch(() => {});
-            await new Promise(res => setTimeout(res, cfg.typingDelayMs || 800));
-            await sock.sendPresenceUpdate('available', jid).catch(() => {});
-            const reply = memory.generateOfflineReply(text, cfg.mood || 'calm');
-            await sock.sendMessage(jid, { text: reply }, { quoted: msg });
-          } catch (err) {
-            logger.error('Failed to send chat reply: ' + (err.stack || err));
-          }
+            await sock.sendPresenceUpdate('composing', remoteJid).catch(()=>{});
+            await new Promise(res => setTimeout(res, freshCfg.typingDelayMs||800));
+            await sock.sendPresenceUpdate('available', remoteJid).catch(()=>{});
+            const reply = mem.generateOfflineReply(text, freshCfg.mood||'calm');
+            await sock.sendMessage(remoteJid, { text: reply }, { quoted: msg });
+          } catch (err) { logger.error('Chat reply failed: '+(err.stack||err)); }
         }
 
       } catch (err) {
-        logger.error('messages.upsert handler error: ' + (err.stack || err));
+        logger.error('messages.upsert error: '+(err.stack||err));
       }
     });
 
-    // group participants update -> scan members on join/leave
+    // group participants update
     sock.ev.on('group-participants.update', async (gp) => {
       try {
-        // gp: { id, participants, action }
-        const groupId = gp.id;
         for (const p of gp.participants) {
-          // p is JID
-          await memory.ensureUserExists(p);
+          db.ensureUser(p);
         }
-        logger.info(`Group update (${gp.action}) logged for ${gp.participants.length} participant(s) in ${groupId}`);
+        logger.info(`Group update (${gp.action}) logged`);
       } catch (err) {
-        logger.error('group-participants.update handler error: ' + (err.stack || err));
+        logger.error('group update err: ' + (err.stack||err));
       }
     });
 
-    // periodic prune (every 12 hours) to keep memory small
-    setInterval(async () => {
-      try {
-        await memory.pruneOld();
-      } catch (err) {
-        logger.error('Memory prune error: ' + (err.stack || err));
-      }
-    }, 12 * 3600 * 1000);
+    // dashboard
+    startDashboard(cfg.dashboardPort || 3000);
+
+    // periodic prune using the memory module
+    setInterval(async ()=> {
+      try { await mem.pruneOld(); }
+      catch(e){ logger.error('Prune error: '+(e.stack||e)); }
+    }, 12*3600*1000);
 
     // process-level handlers
-    process.on('unhandledRejection', (reason, p) => {
-      logger.error(`Unhandled Rejection at: Promise ${p} reason: ${reason}`);
-    });
-    process.on('uncaughtException', (err) => {
-      logger.error('Uncaught Exception: ' + (err.stack || err));
-    });
+    process.on('unhandledRejection', (r,p)=> logger.error(`Unhandled Rejection: ${r}`));
+    process.on('uncaughtException', (e)=> logger.error('Uncaught Exception: '+(e.stack||e)));
 
   } catch (err) {
-    logger.error('Fatal start error: ' + (err.stack || err));
-    setTimeout(() => start().catch(e => logger.error('Retry start failed: ' + (e.stack || e))), 3000);
+    logger.error('Start fatal: ' + (err.stack || err));
+    setTimeout(()=>start().catch(e=>logger.error('Retry failed: '+(e.stack||e))),3000);
   }
 }
 
-start().catch(e => logger.error('Start failed: ' + (e.stack || e)));
+start().catch(e=>logger.error('Start failed: '+(e.stack||e)));
