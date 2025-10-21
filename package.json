@@ -1,0 +1,13 @@
+{
+  "name": "acheron-v3",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "main.js",
+  "scripts": {
+    "start": "node main.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^4.0.0",
+    "qrcode-terminal": "^0.12.0"
+  }
+}
