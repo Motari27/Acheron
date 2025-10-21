@@ -1,13 +1,19 @@
 {
-  "name": "acheron-v3",
+  "name": "acheron-v4",
   "version": "1.0.0",
   "type": "module",
   "main": "main.js",
   "scripts": {
-    "start": "node main.js"
+    "start": "node main.js",
+    "migrate": "node scripts/migrate-json-to-sql.js"
   },
   "dependencies": {
     "@whiskeysockets/baileys": "^4.0.0",
-    "qrcode-terminal": "^0.12.0"
+    "qrcode-terminal": "^0.12.0",
+    "better-sqlite3": "^8.1.0",
+    "express": "^4.18.2"
+  },
+  "devDependencies": {
+    "pm2": "^5.2.0"
   }
 }
